@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Patches</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 15px/1.4 system-ui, sans-serif; margin: 0; }
+    header { padding: 16px 20px 8px; }
+    h1 { font-size: 20px; margin: 0 0 8px; }
+    nav { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+    nav button { background: none; border: 0; color: #0b57d0; cursor: pointer; padding: 0; font: inherit; }
+    main { padding: 0 20px 32px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #ccc; }
+    th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    td.size, td.mtime { white-space: nowrap; font-variant-numeric: tabular-nums; }
+    a { color: inherit; }
+    .err { color: #b00020; }
+    #status { color: #666; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Patches</h1>
+    <nav id="crumbs"></nav>
+    <p id="status"></p>
+  </header>
+  <main>
+    <table>
+      <thead>
+        <tr><th>Name</th><th>Size</th><th>Modified</th></tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </main>
+  <script>
+    const crumbs = document.getElementById('crumbs');
+    const rows = document.getElementById('rows');
+    const status = document.getElementById('status');
+
+    function formatSize(bytes) {
+      if (bytes == null) return '';
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let n = bytes;
+      let i = 0;
+      while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+      return (i === 0 ? n : n.toFixed(1)) + ' ' + units[i];
+    }
+
+    function formatTime(iso) {
+      if (!iso) return '';
+      const d = new Date(iso);
+      return d.toLocaleString();
+    }
+
+    function fileHref(rel) {
+      return '/files/' + rel.split('/').map(encodeURIComponent).join('/');
+    }
+
+    async function openDir(rel) {
+      status.textContent = 'Loading…';
+      rows.innerHTML = '';
+      const res = await fetch('/api/list?path=' + encodeURIComponent(rel || ''));
+      const data = await res.json();
+      if (!res.ok) {
+        status.textContent = data.error || 'Failed to list directory';
+        status.className = 'err';
+        return;
+      }
+      status.className = '';
+      const stats = data.patchStats;
+      let line = data.root;
+      if (stats) {
+        line += ' — total patches: ' + formatSize(stats.totalBytes);
+        if (stats.totalFiles != null) line += ' (' + stats.totalFiles + ' files)';
+        if (stats.currentSubtreeBytes != null && data.path) {
+          line += ' — this folder: ' + formatSize(stats.currentSubtreeBytes);
+        }
+      }
+      status.textContent = line;
+      renderCrumbs(data.path || '');
+      if (!data.entries.length) {
+        rows.innerHTML = '<tr><td colspan="3">Empty directory</td></tr>';
+        return;
+      }
+      for (const entry of data.entries) {
+        const tr = document.createElement('tr');
+        const name = document.createElement('td');
+        if (entry.type === 'dir') {
+          const btn = document.createElement('button');
+          btn.textContent = entry.name + '/';
+          btn.addEventListener('click', () => {
+            location.hash = entry.path;
+          });
+          name.appendChild(btn);
+        } else {
+          const a = document.createElement('a');
+          a.href = fileHref(entry.path);
+          a.textContent = entry.name;
+          a.setAttribute('download', entry.name);
+          name.appendChild(a);
+        }
+        const size = document.createElement('td');
+        size.className = 'size';
+        size.textContent =
+          entry.type === 'dir'
+            ? entry.subtreeSize != null
+              ? formatSize(entry.subtreeSize)
+              : '—'
+            : formatSize(entry.size);
+        const mtime = document.createElement('td');
+        mtime.className = 'mtime';
+        mtime.textContent = formatTime(entry.mtime);
+        tr.append(name, size, mtime);
+        rows.appendChild(tr);
+      }
+    }
+
+    function renderCrumbs(rel) {
+      crumbs.innerHTML = '';
+      const parts = rel ? rel.split('/') : [];
+      const root = document.createElement('button');
+      root.textContent = 'patches';
+      root.addEventListener('click', () => { location.hash = ''; });
+      crumbs.appendChild(root);
+      parts.forEach((part, index) => {
+        const sep = document.createElement('span');
+        sep.textContent = ' / ';
+        crumbs.appendChild(sep);
+        const btn = document.createElement('button');
+        btn.textContent = part;
+        const next = parts.slice(0, index + 1).join('/');
+        btn.addEventListener('click', () => { location.hash = next; });
+        crumbs.appendChild(btn);
+      });
+    }
+
+    function fromHash() {
+      const raw = location.hash.replace(/^#/, '');
+      try { return decodeURIComponent(raw); } catch (e) { return ''; }
+    }
+
+    window.addEventListener('hashchange', () => openDir(fromHash()));
+    openDir(fromHash());
+  </script>
+</body>
+</html>

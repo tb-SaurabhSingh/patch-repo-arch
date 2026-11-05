@@ -1,0 +1,13 @@
+{
+  "name": "repoarch-patches",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Expose NFS patch directories to the browser",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
