@@ -1,10 +1,14 @@
 'use strict';
 
+const { execFile } = require('child_process');
 const fs = require('fs');
 const fsp = fs.promises;
 const http = require('http');
 const path = require('path');
+const { promisify } = require('util');
 const { URL } = require('url');
+
+const execFileAsync = promisify(execFile);
 
 function loadEnvFile() {
   const envPath = path.join(__dirname, '..', '.env');
@@ -41,6 +45,8 @@ function pickRoot() {
 }
 
 const ROOT = pickRoot();
+const DU_TIMEOUT_MS = Number(process.env.DU_TIMEOUT_MS) || 3_600_000;
+const GLOBAL_STATS_TTL_MS = Number(process.env.GLOBAL_STATS_TTL_MS) || 300_000;
 
 function insideRoot(resolved) {
   const rootWithSep = ROOT.endsWith(path.sep) ? ROOT : ROOT + path.sep;
@@ -88,69 +94,73 @@ async function resolveInside(rel) {
   return { target, real };
 }
 
-async function measureSubtree(dirPath) {
-  const rootReal = await fsp.realpath(ROOT);
-  const rootWithSep = rootReal.endsWith(path.sep) ? rootReal : rootReal + path.sep;
-  const seen = new Set();
-  let totalBytes = 0;
-  let totalFiles = 0;
-
-  async function walk(dir) {
-    let real;
-    try {
-      real = await fsp.realpath(dir);
-    } catch (err) {
-      return;
-    }
-    if (seen.has(real)) return;
-    seen.add(real);
-    if (real !== rootReal && !real.startsWith(rootWithSep)) return;
-
-    let names;
-    try {
-      names = await fsp.readdir(real);
-    } catch (err) {
-      return;
-    }
-    for (const name of names) {
-      const full = path.join(real, name);
-      let stat;
-      try {
-        stat = await fsp.stat(full);
-      } catch (err) {
-        continue;
-      }
-      if (stat.isFile()) {
-        totalBytes += stat.size;
-        totalFiles += 1;
-      } else if (stat.isDirectory()) {
-        await walk(full);
-      }
-    }
-  }
-
-  await walk(dirPath);
-  return { totalBytes, totalFiles };
+function parseDuLine(line) {
+  const tab = line.indexOf('\t');
+  if (tab === -1) return null;
+  const bytes = Number(line.slice(0, tab));
+  if (!Number.isFinite(bytes)) return null;
+  return { bytes, dirPath: line.slice(tab + 1) };
 }
 
-let globalStatsCache = { at: 0, totalBytes: 0, totalFiles: 0 };
-const GLOBAL_STATS_TTL_MS = 60_000;
+async function duSubtreeBytes(dirReal) {
+  const { stdout } = await execFileAsync('du', ['-sb', dirReal], {
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: DU_TIMEOUT_MS
+  });
+  const parsed = parseDuLine(stdout.trim().split('\n')[0] || '');
+  return parsed ? parsed.bytes : 0;
+}
+
+async function duImmediateChildBytes(dirReal) {
+  const { stdout } = await execFileAsync(
+    'du',
+    ['-b', '--max-depth=1', '-x', dirReal],
+    { maxBuffer: 64 * 1024 * 1024, timeout: DU_TIMEOUT_MS }
+  );
+  const children = new Map();
+  let selfBytes = null;
+  const dirNorm = path.resolve(dirReal);
+  for (const line of stdout.trim().split('\n')) {
+    if (!line) continue;
+    const parsed = parseDuLine(line);
+    if (!parsed) continue;
+    if (path.resolve(parsed.dirPath) === dirNorm) {
+      selfBytes = parsed.bytes;
+      continue;
+    }
+    children.set(path.basename(parsed.dirPath), parsed.bytes);
+  }
+  return { selfBytes, children };
+}
+
+let globalStatsCache = { at: 0, totalBytes: null, totalFiles: null };
+
+function noteGlobalBytes(totalBytes) {
+  if (totalBytes == null) return;
+  globalStatsCache = { at: Date.now(), totalBytes, totalFiles: null };
+}
 
 async function globalPatchStats() {
   const now = Date.now();
-  if (now - globalStatsCache.at < GLOBAL_STATS_TTL_MS) {
+  if (
+    globalStatsCache.at &&
+    now - globalStatsCache.at < GLOBAL_STATS_TTL_MS &&
+    globalStatsCache.totalBytes != null
+  ) {
     return {
       totalBytes: globalStatsCache.totalBytes,
       totalFiles: globalStatsCache.totalFiles
     };
   }
-  const measured = await measureSubtree(ROOT);
-  globalStatsCache = { at: now, ...measured };
-  return measured;
+  const rootReal = await fsp.realpath(ROOT);
+  const totalBytes = await duSubtreeBytes(rootReal);
+  noteGlobalBytes(totalBytes);
+  return { totalBytes, totalFiles: null };
 }
 
-async function listDirectory(rel) {
-  const { target } = await resolveInside(rel);
+async function listDirectory(rel, options) {
+  const skipDu = options && options.skipDu;
+  const { target, real } = await resolveInside(rel);
   const stat = await fsp.stat(target);
   if (!stat.isDirectory()) {
     const error = new Error('Not a directory');
@@ -183,15 +193,36 @@ async function listDirectory(rel) {
     return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
   });
 
-  const dirEntries = entries.filter((entry) => entry.type === 'dir');
-  const [currentMeasured, globalMeasured] = await Promise.all([
-    measureSubtree(target),
-    globalPatchStats(),
-    ...dirEntries.map(async (entry) => {
-      const measured = await measureSubtree(path.join(target, entry.name));
-      entry.subtreeSize = measured.totalBytes;
-    })
-  ]);
+  if (skipDu) {
+    return {
+      path: rel,
+      entries,
+      patchStats: {
+        totalBytes: globalStatsCache.totalBytes,
+        totalFiles: null,
+        currentSubtreeBytes: null
+      }
+    };
+  }
+
+  let selfBytes = null;
+  let childSizes = new Map();
+  try {
+    const du = await duImmediateChildBytes(real);
+    selfBytes = du.selfBytes;
+    childSizes = du.children;
+  } catch (err) {
+    console.error('du failed for ' + real + ':', err.message);
+  }
+
+  if (rel === '' && selfBytes != null) noteGlobalBytes(selfBytes);
+
+  for (const entry of entries) {
+    if (entry.type !== 'dir') continue;
+    if (childSizes.has(entry.name)) entry.subtreeSize = childSizes.get(entry.name);
+  }
+
+  const globalMeasured = await globalPatchStats();
 
   return {
     path: rel,
@@ -199,7 +230,7 @@ async function listDirectory(rel) {
     patchStats: {
       totalBytes: globalMeasured.totalBytes,
       totalFiles: globalMeasured.totalFiles,
-      currentSubtreeBytes: currentMeasured.totalBytes
+      currentSubtreeBytes: selfBytes
     }
   };
 }
@@ -400,7 +431,8 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/api/list') {
       const rel = decodeRel(url.searchParams.get('path') || '');
-      const listing = await listDirectory(rel);
+      const skipDu = url.searchParams.get('stats') === '0';
+      const listing = await listDirectory(rel, { skipDu });
       sendJson(res, 200, {
         root: ROOT,
         path: listing.path,
